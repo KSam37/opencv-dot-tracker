@@ -1,0 +1,696 @@
+"""
+Dot Tracker GUI — batch-process Instron tensile test videos.
+
+Launch:  python app.py
+"""
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import cv2
+import numpy as np
+from PIL import Image, ImageTk
+import csv
+import threading
+import queue
+from pathlib import Path
+import matplotlib
+matplotlib.use("TkAgg")
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+
+from tracker_core import (VideoTracker, annotate_frame,
+                          extract_initial_distance_mm)
+
+BASE_DIR = Path(__file__).resolve().parent
+INPUT_DIR = BASE_DIR / "input_videos"
+OUTPUT_DIR = BASE_DIR / "output_data"
+INPUT_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+FRAME_SKIP_OPTIONS = {"Every frame": 1, "Every 2nd frame": 2, "Every 4th frame": 4}
+
+
+# ── Messages from worker thread to UI ────────────────────────────────────────
+class MsgProgress:
+    def __init__(self, vid_idx, frame_idx, total_frames, frame_bgr):
+        self.vid_idx = vid_idx
+        self.frame_idx = frame_idx
+        self.total_frames = total_frames
+        self.frame_bgr = frame_bgr  # may be None (not every frame sent)
+
+class MsgDone:
+    def __init__(self, vid_idx, tracker):
+        self.vid_idx = vid_idx
+        self.tracker = tracker  # finished VideoTracker with results/positions
+
+class MsgError:
+    def __init__(self, vid_idx, error_msg):
+        self.vid_idx = vid_idx
+        self.error_msg = error_msg
+
+class MsgAllDone:
+    pass
+
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Instron Dot Tracker")
+        self.geometry("1280x860")
+        self.minsize(1000, 700)
+
+        # State
+        self.video_files = []           # list of Path
+        self.trackers = {}              # {idx: finished VideoTracker}
+        self.cleaned_data = {}          # {idx: [(t, d), ...]} cleaned results
+        self.processing = False
+        self.stop_requested = False
+        self.msg_queue = queue.Queue()
+        self.worker_thread = None
+        self._photo = None
+        self._current_processing_idx = -1
+        self._current_processing_frame = None  # latest BGR from worker
+
+        # Review state
+        self._review_cap = None         # cv2.VideoCapture for scrubbing
+        self._review_idx = None         # which video index we're reviewing
+        self._playing = False
+        self._play_after_id = None
+        self._scrub_blocked = False
+
+        self._build_ui()
+        self._poll_queue()
+
+    def destroy(self):
+        self._playing = False
+        self.stop_requested = True
+        if self._review_cap is not None:
+            self._review_cap.release()
+        super().destroy()
+
+    # ------------------------------------------------------------------ UI
+    def _build_ui(self):
+        toolbar = ttk.Frame(self, padding=6)
+        toolbar.pack(fill="x")
+
+        ttk.Button(toolbar, text="Add Videos...", command=self._add_videos).pack(side="left", padx=3)
+        ttk.Button(toolbar, text="Add from input_videos/", command=self._add_from_default).pack(side="left", padx=3)
+        ttk.Button(toolbar, text="Clear List", command=self._clear_list).pack(side="left", padx=3)
+
+        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=8)
+
+        ttk.Label(toolbar, text="Frame skip:").pack(side="left")
+        self.skip_var = tk.StringVar(value="Every frame")
+        ttk.Combobox(toolbar, textvariable=self.skip_var,
+                     values=list(FRAME_SKIP_OPTIONS.keys()),
+                     state="readonly", width=16).pack(side="left", padx=3)
+
+        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=8)
+
+        self.run_btn = ttk.Button(toolbar, text="Run All", command=self._run_all)
+        self.run_btn.pack(side="left", padx=3)
+        self.stop_btn = ttk.Button(toolbar, text="Stop", command=self._stop, state="disabled")
+        self.stop_btn.pack(side="left", padx=3)
+
+        # Main paned layout
+        pane = ttk.PanedWindow(self, orient="horizontal")
+        pane.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        # Left: video list
+        left = ttk.Frame(pane, width=280)
+        pane.add(left, weight=0)
+
+        ttk.Label(left, text="Videos", font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=4, pady=(4, 2))
+        list_frame = ttk.Frame(left)
+        list_frame.pack(fill="both", expand=True)
+        self.listbox = tk.Listbox(list_frame, selectmode="browse", font=("Consolas", 10))
+        sb = ttk.Scrollbar(list_frame, orient="vertical", command=self.listbox.yview)
+        self.listbox.configure(yscrollcommand=sb.set)
+        self.listbox.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.listbox.bind("<<ListboxSelect>>", self._on_list_select)
+
+        # Right: tabs
+        right = ttk.Frame(pane)
+        pane.add(right, weight=1)
+
+        # Status bar
+        status_frame = ttk.Frame(right)
+        status_frame.pack(fill="x", padx=4, pady=4)
+        self.status_label = ttk.Label(status_frame, text="Ready", font=("Segoe UI", 10))
+        self.status_label.pack(side="left")
+        self.progress_bar = ttk.Progressbar(status_frame, mode="determinate", length=300)
+        self.progress_bar.pack(side="right")
+
+        self.notebook = ttk.Notebook(right)
+        self.notebook.pack(fill="both", expand=True)
+
+        # Tab 1: Video preview + controls
+        self.video_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.video_tab, text="  Video Preview  ")
+
+        # Pack bottom controls FIRST so they get space before the canvas fills the rest
+        self.video_info_label = ttk.Label(self.video_tab, text="", font=("Consolas", 9))
+        self.video_info_label.pack(side="bottom", fill="x", padx=4)
+
+        ctrl_frame = ttk.Frame(self.video_tab)
+        ctrl_frame.pack(side="bottom", fill="x", padx=4, pady=4)
+
+        self.play_btn = ttk.Button(ctrl_frame, text="Play", width=6, command=self._toggle_play)
+        self.play_btn.pack(side="left", padx=2)
+
+        self.scrub_var = tk.IntVar(value=0)
+        self.scrub_scale = ttk.Scale(ctrl_frame, from_=0, to=100,
+                                     orient="horizontal", variable=self.scrub_var,
+                                     command=self._on_scrub)
+        self.scrub_scale.pack(side="left", fill="x", expand=True, padx=6)
+
+        self.time_label = ttk.Label(ctrl_frame, text="0.0s / 0.0s", width=18, anchor="center")
+        self.time_label.pack(side="right")
+
+        # Canvas fills remaining space
+        self.canvas_label = ttk.Label(self.video_tab, anchor="center")
+        self.canvas_label.pack(fill="both", expand=True)
+
+        # Tab 2: Data table
+        self.data_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.data_tab, text="  Data Table  ")
+
+        tree_frame = ttk.Frame(self.data_tab)
+        tree_frame.pack(fill="both", expand=True, padx=4, pady=4)
+        self.tree = ttk.Treeview(tree_frame, columns=("time", "distance", "displacement"), show="headings", height=25)
+        self.tree.heading("time", text="Time (s)")
+        self.tree.heading("distance", text="Distance")
+        self.tree.heading("displacement", text="Displacement")
+        self.tree.column("time", width=120, anchor="center")
+        self.tree.column("distance", width=140, anchor="center")
+        self.tree.column("displacement", width=140, anchor="center")
+        tree_sb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=tree_sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        tree_sb.pack(side="right", fill="y")
+
+        export_frame = ttk.Frame(self.data_tab)
+        export_frame.pack(fill="x", padx=4, pady=4)
+        ttk.Button(export_frame, text="Export CSV...", command=self._export_csv).pack(side="right")
+        ttk.Button(export_frame, text="Export Cleaned CSV...", command=self._export_cleaned_csv).pack(side="right", padx=4)
+        ttk.Button(export_frame, text="Clean Outliers", command=self._clean_outliers).pack(side="left", padx=4)
+        self.clean_label = ttk.Label(export_frame, text="", font=("Segoe UI", 9))
+        self.clean_label.pack(side="left", padx=4)
+
+        # Tab 3: Plot
+        self.plot_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.plot_tab, text="  Plot  ")
+
+        self.fig = Figure(figsize=(7, 4), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        self.fig.tight_layout()
+        self.plot_canvas = FigureCanvasTkAgg(self.fig, master=self.plot_tab)
+        self.plot_canvas.get_tk_widget().pack(fill="both", expand=True)
+
+    # --------------------------------------------------------- File management
+    def _add_videos(self):
+        files = filedialog.askopenfilenames(
+            title="Select video files", initialdir=str(INPUT_DIR),
+            filetypes=[("Video files", "*.mov *.mp4 *.avi *.mkv *.wmv"), ("All", "*.*")])
+        for f in files:
+            p = Path(f)
+            if p not in self.video_files:
+                self.video_files.append(p)
+                self.listbox.insert("end", p.name)
+
+    def _add_from_default(self):
+        exts = {'.mov', '.mp4', '.avi', '.mkv', '.wmv'}
+        found = sorted(f for f in INPUT_DIR.iterdir() if f.suffix.lower() in exts)
+        if not found:
+            messagebox.showinfo("Info", f"No video files in:\n{INPUT_DIR}")
+            return
+        for p in found:
+            if p not in self.video_files:
+                self.video_files.append(p)
+                self.listbox.insert("end", p.name)
+
+    def _clear_list(self):
+        if self.processing:
+            return
+        self.video_files.clear()
+        self.listbox.delete(0, "end")
+        self.trackers.clear()
+        self.cleaned_data.clear()
+        self._close_review()
+
+    # --------------------------------------------------------- List selection / review
+    def _on_list_select(self, _event=None):
+        sel = self.listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+
+        if idx in self.trackers:
+            # Completed video — open for review
+            self._open_review(idx)
+            self._show_results_tabs(idx)
+        elif idx == self._current_processing_idx and self._current_processing_frame is not None:
+            # Currently processing — show latest frame
+            self._show_frame(self._current_processing_frame)
+            self.notebook.select(self.video_tab)
+
+    def _open_review(self, idx):
+        self._playing = False
+        self._close_review()
+        self._review_idx = idx
+        tracker = self.trackers[idx]
+        path = self.video_files[idx]
+
+        cap = cv2.VideoCapture(str(path))
+        if not cap.isOpened():
+            print(f"Cannot open video for review: {path}")
+            return
+        self._review_cap = cap
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        # Temporarily block scrub callback while reconfiguring
+        self._scrub_blocked = True
+        self.scrub_scale.configure(to=max(total - 1, 1))
+        self.scrub_var.set(0)
+        self._scrub_blocked = False
+
+        self.video_info_label.configure(text=tracker.info_text)
+        self.play_btn.configure(text="Play")
+        self.notebook.select(self.video_tab)
+
+        # Show first frame
+        self._show_review_frame(0)
+
+    def _close_review(self):
+        self._playing = False
+        if self._play_after_id is not None:
+            self.after_cancel(self._play_after_id)
+            self._play_after_id = None
+        if self._review_cap is not None:
+            self._review_cap.release()
+            self._review_cap = None
+        self._review_idx = None
+
+    def _show_review_frame(self, frame_idx):
+        """Read a specific frame and overlay tracked positions."""
+        if self._review_cap is None or self._review_idx is None:
+            return
+        tracker = self.trackers.get(self._review_idx)
+        if tracker is None:
+            return
+
+        self._review_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = self._review_cap.read()
+        if not ret:
+            return
+
+        # Find the closest tracked position for this frame
+        pos_top, pos_bot, dist_val = None, None, None
+        if tracker.frame_indices:
+            fi = np.array(tracker.frame_indices)
+            closest = np.searchsorted(fi, frame_idx, side='right') - 1
+            closest = max(0, min(closest, len(tracker.positions) - 1))
+            pos_top, pos_bot = tracker.positions[closest]
+            dist_val = tracker.results[closest][1]
+
+        annotated = annotate_frame(frame, pos_top, pos_bot, dist_val, tracker.unit)
+        self._show_frame(annotated)
+
+        fps = self._review_cap.get(cv2.CAP_PROP_FPS) or 30
+        total = int(self._review_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        t_cur = frame_idx / fps
+        t_total = total / fps
+        self.time_label.configure(text=f"{t_cur:.1f}s / {t_total:.1f}s")
+
+    def _on_scrub(self, val):
+        if getattr(self, '_scrub_blocked', False):
+            return
+        if self._review_cap is None:
+            return
+        frame_idx = int(float(val))
+        self._show_review_frame(frame_idx)
+
+    def _toggle_play(self):
+        if self._review_cap is None:
+            # If no review is open but a completed video is selected, open it
+            sel = self.listbox.curselection()
+            if sel and sel[0] in self.trackers:
+                self._open_review(sel[0])
+            return
+        self._playing = not self._playing
+        self.play_btn.configure(text="Pause" if self._playing else "Play")
+        if self._playing:
+            self._play_step()
+
+    def _play_step(self):
+        if not self._playing or self._review_cap is None:
+            return
+        fps = self._review_cap.get(cv2.CAP_PROP_FPS) or 30
+        total = int(self._review_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cur = self.scrub_var.get() + 1
+        if cur >= total:
+            self._playing = False
+            self.play_btn.configure(text="Play")
+            return
+        # Update scrub position without triggering _on_scrub redundantly
+        self._scrub_blocked = True
+        self.scrub_var.set(cur)
+        self._scrub_blocked = False
+        self._show_review_frame(cur)
+        delay = max(1, int(1000 / fps))
+        self._play_after_id = self.after(delay, self._play_step)
+
+    def _show_results_tabs(self, idx):
+        has_cleaned = idx in self.cleaned_data
+        self._show_data_table(idx, cleaned=has_cleaned)
+        self._show_plot(idx, cleaned=has_cleaned)
+        if has_cleaned:
+            raw_n = len(self.trackers[idx].results)
+            clean_n = len(self.cleaned_data[idx])
+            self.clean_label.configure(text=f"Removed {raw_n - clean_n} outliers ({(raw_n - clean_n)/raw_n*100:.1f}%)")
+        else:
+            self.clean_label.configure(text="")
+
+    # --------------------------------------------------------- Processing
+    def _run_all(self):
+        if not self.video_files:
+            messagebox.showinfo("Info", "Add some videos first.")
+            return
+        self.processing = True
+        self.stop_requested = False
+        self.run_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self._close_review()
+
+        skip = FRAME_SKIP_OPTIONS[self.skip_var.get()]
+        indices = list(range(len(self.video_files)))
+
+        self.worker_thread = threading.Thread(
+            target=self._worker, args=(indices, skip), daemon=True)
+        self.worker_thread.start()
+
+    def _stop(self):
+        self.stop_requested = True
+        self.stop_btn.configure(state="disabled")
+
+    def _worker(self, indices, skip):
+        """Runs in background thread — processes videos as fast as possible."""
+        for vid_idx in indices:
+            if self.stop_requested:
+                break
+
+            path = self.video_files[vid_idx]
+            init_dist = extract_initial_distance_mm(path.stem)
+            tracker = VideoTracker(path, frame_skip=skip, initial_distance_mm=init_dist)
+
+            first = tracker.open()
+            if first is None:
+                self.msg_queue.put(MsgError(vid_idx, tracker.error or "Unknown error"))
+                continue
+
+            # Send first frame
+            self.msg_queue.put(MsgProgress(vid_idx, 0, tracker.total_frames, first))
+
+            frame_count = 0
+            while not tracker.finished and not self.stop_requested:
+                frame = tracker.step()
+                frame_count += 1
+                # Send frame to UI periodically (every ~20 processed frames)
+                send_frame = frame if (frame_count % 20 == 0) else None
+                self.msg_queue.put(MsgProgress(
+                    vid_idx, tracker.current_frame_idx, tracker.total_frames, send_frame))
+
+            if self.stop_requested:
+                tracker.release()
+                break
+
+            tracker.release()
+
+            # Save CSV
+            csv_path = OUTPUT_DIR / (path.stem + ".csv")
+            tracker.save_csv(csv_path)
+
+            self.msg_queue.put(MsgDone(vid_idx, tracker))
+
+        self.msg_queue.put(MsgAllDone())
+
+    def _poll_queue(self):
+        """Drain the message queue from the worker thread (runs on UI thread)."""
+        try:
+            while True:
+                msg = self.msg_queue.get_nowait()
+                if isinstance(msg, MsgProgress):
+                    self._handle_progress(msg)
+                elif isinstance(msg, MsgDone):
+                    self._handle_done(msg)
+                elif isinstance(msg, MsgError):
+                    self._handle_error(msg)
+                elif isinstance(msg, MsgAllDone):
+                    self._handle_all_done()
+        except queue.Empty:
+            pass
+        self.after(30, self._poll_queue)
+
+    def _handle_progress(self, msg):
+        self._current_processing_idx = msg.vid_idx
+        if msg.total_frames > 0:
+            self.progress_bar["value"] = msg.frame_idx / msg.total_frames * 100
+
+        n_total = len(self.video_files)
+        self.status_label.configure(
+            text=f"Processing [{msg.vid_idx + 1}/{n_total}] {self.video_files[msg.vid_idx].name}  "
+                 f"({msg.frame_idx}/{msg.total_frames})")
+
+        if msg.frame_bgr is not None:
+            self._current_processing_frame = msg.frame_bgr
+            # Show live preview only if user is watching this video (or no review open)
+            sel = self.listbox.curselection()
+            viewing_current = (not sel) or (sel and sel[0] == msg.vid_idx)
+            if viewing_current and self._review_idx is None:
+                self._show_frame(msg.frame_bgr)
+                self.notebook.select(self.video_tab)
+
+    def _handle_done(self, msg):
+        self.trackers[msg.vid_idx] = msg.tracker
+        name = self.video_files[msg.vid_idx].name
+        self.listbox.delete(msg.vid_idx)
+        self.listbox.insert(msg.vid_idx, f"\u2713  {name}")
+        self.progress_bar["value"] = 100
+
+    def _handle_error(self, msg):
+        name = self.video_files[msg.vid_idx].name
+        self.listbox.delete(msg.vid_idx)
+        self.listbox.insert(msg.vid_idx, f"\u2717  {name}")
+        print(f"ERROR [{name}]: {msg.error_msg}")
+
+    def _handle_all_done(self):
+        self.processing = False
+        self.stop_requested = False
+        self.run_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        self._current_processing_idx = -1
+        n = len(self.trackers)
+        self.status_label.configure(text=f"Done — {n} video(s) processed. CSVs saved to output_data/")
+        self.progress_bar["value"] = 0
+
+    # --------------------------------------------------------- Display
+    def _show_frame(self, bgr_frame):
+        self.canvas_label.update_idletasks()
+        cw = max(self.canvas_label.winfo_width(), 200)
+        ch = max(self.canvas_label.winfo_height(), 200)
+        fh, fw = bgr_frame.shape[:2]
+        scale = min(cw / fw, ch / fh, 1.0)
+        new_w, new_h = int(fw * scale), int(fh * scale)
+        resized = cv2.resize(bgr_frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(rgb)
+        self._photo = ImageTk.PhotoImage(img)
+        self.canvas_label.configure(image=self._photo)
+
+    # --------------------------------------------------------- Outlier cleaning
+    def _get_selected_tracker(self):
+        sel = self.listbox.curselection()
+        if not sel:
+            return None, None
+        idx = sel[0]
+        return idx, self.trackers.get(idx)
+
+    def _clean_outliers(self):
+        idx, tracker = self._get_selected_tracker()
+        if tracker is None:
+            messagebox.showinfo("Info", "Select a completed video first.")
+            return
+
+        times = np.array([r[0] for r in tracker.results])
+        dists = np.array([r[1] for r in tracker.results])
+        n_orig = len(dists)
+
+        cleaned_t, cleaned_d = clean_data(times, dists)
+        n_removed = n_orig - len(cleaned_d)
+
+        self.cleaned_data[idx] = list(zip(cleaned_t.tolist(), cleaned_d.tolist()))
+        self.clean_label.configure(text=f"Removed {n_removed} outliers ({n_removed/n_orig*100:.1f}%)")
+
+        # Update table to show cleaned data
+        self._show_data_table(idx, cleaned=True)
+        # Update plot with both raw and cleaned
+        self._show_plot(idx, cleaned=True)
+
+    def _show_data_table(self, idx, cleaned=False):
+        tracker = self.trackers.get(idx)
+        if tracker is None:
+            return
+        self.tree.delete(*self.tree.get_children())
+        self.tree.heading("distance", text=f"Distance ({tracker.unit})")
+        self.tree.heading("displacement", text=f"Displacement ({tracker.unit})")
+
+        if cleaned and idx in self.cleaned_data:
+            data = self.cleaned_data[idx]
+        else:
+            data = tracker.results
+
+        d0 = data[0][1] if data else 0
+        for t, d in data:
+            disp = d - d0
+            self.tree.insert("", "end", values=(f"{t:.4f}", f"{d:.4f}", f"{disp:.4f}"))
+
+    def _show_plot(self, idx, cleaned=False):
+        tracker = self.trackers.get(idx)
+        if tracker is None:
+            return
+        self.ax.clear()
+
+        raw_t = [r[0] for r in tracker.results]
+        raw_d0 = tracker.results[0][1] if tracker.results else 0
+        raw_disp = [r[1] - raw_d0 for r in tracker.results]
+
+        if cleaned and idx in self.cleaned_data:
+            clean = self.cleaned_data[idx]
+            clean_d0 = clean[0][1] if clean else 0
+            clean_t = [r[0] for r in clean]
+            clean_disp = [r[1] - clean_d0 for r in clean]
+            self.ax.plot(raw_t, raw_disp, linewidth=0.8, color="#cccccc", label="Raw", zorder=1)
+            self.ax.plot(clean_t, clean_disp, linewidth=1.2, color="#2563eb", label="Cleaned", zorder=2)
+            self.ax.legend(loc="upper left", fontsize=9)
+        else:
+            self.ax.plot(raw_t, raw_disp, linewidth=1.2, color="#2563eb")
+
+        self.ax.set_xlabel("Time (s)")
+        self.ax.set_ylabel(f"Displacement ({tracker.unit})")
+        self.ax.set_title(self.video_files[idx].name)
+        self.ax.grid(True, alpha=0.3)
+        self.fig.tight_layout()
+        self.plot_canvas.draw()
+
+    # --------------------------------------------------------- Export
+    def _write_displacement_csv(self, path, data, unit):
+        """Write time and displacement (distance - initial distance) to CSV."""
+        d0 = data[0][1] if data else 0
+        with open(path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(["time_s", f"displacement_{unit}"])
+            for t, d in data:
+                writer.writerow([f"{t:.4f}", f"{d - d0:.4f}"])
+
+    def _export_csv(self):
+        idx, tracker = self._get_selected_tracker()
+        if tracker is None:
+            messagebox.showinfo("Info", "Select a completed video first.")
+            return
+        stem = self.video_files[idx].stem
+        path = filedialog.asksaveasfilename(
+            title="Save CSV", initialdir=str(OUTPUT_DIR),
+            initialfile=f"{stem}.csv", filetypes=[("CSV", "*.csv")])
+        if not path:
+            return
+        self._write_displacement_csv(path, tracker.results, tracker.unit)
+        messagebox.showinfo("Saved", f"CSV saved to:\n{path}")
+
+    def _export_cleaned_csv(self):
+        idx, tracker = self._get_selected_tracker()
+        if tracker is None:
+            messagebox.showinfo("Info", "Select a completed video first.")
+            return
+        if idx not in self.cleaned_data:
+            messagebox.showinfo("Info", "Run 'Clean Outliers' first.")
+            return
+        stem = self.video_files[idx].stem
+        path = filedialog.asksaveasfilename(
+            title="Save Cleaned CSV", initialdir=str(OUTPUT_DIR),
+            initialfile=f"{stem}_cleaned.csv", filetypes=[("CSV", "*.csv")])
+        if not path:
+            return
+        self._write_displacement_csv(path, self.cleaned_data[idx], tracker.unit)
+        messagebox.showinfo("Saved", f"Cleaned CSV saved to:\n{path}")
+
+
+def clean_data(times, dists):
+    """
+    Remove outlier points from tensile test distance data.
+
+    Strategy: tensile tests produce smoothly varying distance curves.
+    Outliers are points where the frame-to-frame change (velocity) is
+    far outside the local norm, indicating a tracking glitch.
+
+    Uses a rolling median of the velocity to detect jumps, then removes
+    points that deviate too far from the local trend.
+    """
+    if len(dists) < 10:
+        return times, dists
+
+    # Pass 1: Remove velocity outliers (sudden jumps)
+    dt = np.diff(times)
+    dd = np.diff(dists)
+    dt[dt == 0] = 1e-6
+    velocity = dd / dt
+
+    # Rolling median velocity over a window
+    window = min(51, len(velocity) // 4 * 2 + 1)
+    if window < 3:
+        window = 3
+    half_w = window // 2
+    keep = np.ones(len(dists), dtype=bool)
+
+    for i in range(len(velocity)):
+        lo = max(0, i - half_w)
+        hi = min(len(velocity), i + half_w + 1)
+        local_v = velocity[lo:hi]
+        med = np.median(local_v)
+        mad = np.median(np.abs(local_v - med))
+        mad = max(mad, 1e-6)
+        # Flag if this velocity is > 5 MADs from median
+        if abs(velocity[i] - med) > 5 * mad:
+            # Remove the endpoint of this jump (i+1)
+            keep[i + 1] = False
+
+    times_1 = times[keep]
+    dists_1 = dists[keep]
+
+    if len(dists_1) < 10:
+        return times_1, dists_1
+
+    # Pass 2: Remove points that deviate from a local moving average
+    window2 = min(31, len(dists_1) // 4 * 2 + 1)
+    if window2 < 3:
+        window2 = 3
+    half_w2 = window2 // 2
+
+    keep2 = np.ones(len(dists_1), dtype=bool)
+    for i in range(len(dists_1)):
+        lo = max(0, i - half_w2)
+        hi = min(len(dists_1), i + half_w2 + 1)
+        local = dists_1[lo:hi]
+        med = np.median(local)
+        mad = np.median(np.abs(local - med))
+        mad = max(mad, 1e-6)
+        if abs(dists_1[i] - med) > 5 * mad:
+            keep2[i] = False
+
+    return times_1[keep2], dists_1[keep2]
+
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
+
