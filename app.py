@@ -87,10 +87,12 @@ class App(tk.Tk):
         self.track_interdot_disp = tk.BooleanVar(value=True)
         self.track_interdot_dist = tk.BooleanVar(value=True)
 
-        # Plot axis selection (dropdown values)
-        self.plot_x_var = tk.StringVar(value='Time (s)')
-        self.plot_y_var = tk.StringVar(value='')
-        self._plot_suspend = False  # block combobox callbacks during programmatic set
+        # Plot axis selection, style, and title
+        self.plot_x_var     = tk.StringVar(value='Time (s)')
+        self.plot_y_var     = tk.StringVar(value='')
+        self.plot_title_var = tk.StringVar(value='')
+        self.plot_style_var = tk.StringVar(value='Line')
+        self._plot_suspend  = False  # block combobox callbacks during programmatic set
 
         self._build_ui()
         self._poll_queue()
@@ -256,6 +258,11 @@ class App(tk.Tk):
         self.plot_y_combo.pack(side="left", padx=(0, 12))
         self.plot_y_combo.bind("<<ComboboxSelected>>", self._on_plot_axis_change)
 
+        ttk.Combobox(plot_ctrl, textvariable=self.plot_style_var,
+                     state="readonly", width=10,
+                     values=["Line", "Scatter"]).pack(side="left", padx=(0, 8))
+        self.plot_style_var.trace_add("write", lambda *_: self._on_plot_axis_change())
+
         ttk.Button(plot_ctrl, text="↺ Refresh",
                    command=self._on_plot_axis_change).pack(side="left", padx=(0, 8))
 
@@ -263,6 +270,15 @@ class App(tk.Tk):
                    command=self._copy_plot).pack(side="right", padx=2)
         ttk.Button(plot_ctrl, text="Save as...",
                    command=self._save_plot).pack(side="right", padx=2)
+
+        # Title row
+        title_row = ttk.Frame(self.plot_tab, padding=(4, 0, 4, 2))
+        title_row.pack(fill="x")
+        ttk.Label(title_row, text="Title:").pack(side="left", padx=(4, 4))
+        self.plot_title_entry = ttk.Entry(title_row, textvariable=self.plot_title_var)
+        self.plot_title_entry.pack(side="left", fill="x", expand=True)
+        self.plot_title_entry.bind("<Return>",    self._on_plot_axis_change)
+        self.plot_title_entry.bind("<FocusOut>",  self._on_plot_axis_change)
 
         self.fig = Figure(figsize=(7, 4), dpi=100)
         self.ax = self.fig.add_subplot(111)
@@ -432,6 +448,9 @@ class App(tk.Tk):
         self._play_after_id = self.after(delay, self._play_step)
 
     def _show_results_tabs(self, idx):
+        # Only reset the plot title when switching to a different video
+        if idx != self._results_idx:
+            self.plot_title_var.set(self.video_files[idx].stem)
         self._results_idx = idx
         has_cleaned = idx in self.cleaned_data
         self._show_data_table(idx, cleaned=has_cleaned)
@@ -866,6 +885,16 @@ class App(tk.Tk):
 
         self.ax.clear()
 
+        style = self.plot_style_var.get()  # "Line" or "Scatter"
+
+        def draw(x, y, color, label=None, zorder=1):
+            kw = dict(color=color, zorder=zorder,
+                      label=label if label else "_nolegend_")
+            if style == "Scatter":
+                self.ax.scatter(x, y, s=6, **kw)
+            else:
+                self.ax.plot(x, y, linewidth=1.2, **kw)
+
         raw_x = self._compute_var(tracker, x_label,
                                   tracker.results, tracker.positions)
         raw_y = self._compute_var(tracker, y_label,
@@ -875,31 +904,31 @@ class App(tk.Tk):
             cd = self.cleaned_data[idx]
             cx = self._compute_var(tracker, x_label, cd['results'], cd['positions'])
             cy = self._compute_var(tracker, y_label, cd['results'], cd['positions'])
-            self.ax.plot(raw_x, raw_y, linewidth=0.8, color="#cccccc",
-                         label="Raw", zorder=1)
-            self.ax.plot(cx, cy, linewidth=1.2, color="#2563eb",
-                         label="Cleaned", zorder=2)
+            if style == "Line":
+                self.ax.plot(raw_x, raw_y, linewidth=0.8, color="#cccccc",
+                             label="Raw", zorder=1)
+            else:
+                self.ax.scatter(raw_x, raw_y, s=4, color="#cccccc",
+                                label="Raw", zorder=1)
+            draw(cx, cy, "#2563eb", label="Cleaned", zorder=2)
             self.ax.legend(loc="best", fontsize=9)
         else:
-            self.ax.plot(raw_x, raw_y, linewidth=1.2, color="#2563eb")
+            draw(raw_x, raw_y, "#2563eb")
 
         self.ax.set_xlabel(x_label)
         self.ax.set_ylabel(y_label)
-        self.ax.set_title(self.video_files[idx].name)
+        self.ax.set_title(self.plot_title_var.get())
         self.ax.grid(True, alpha=0.3)
         self.fig.tight_layout()
         self.plot_canvas.draw()
 
     # --------------------------------------------------------- Plot export
     def _plot_filename_stem(self):
-        idx, _ = self._get_selected_tracker()
-        if idx is None:
-            return "plot"
-        stem = self.video_files[idx].stem
-        y = self.plot_y_var.get() or "plot"
+        title = self.plot_title_var.get().strip() or "plot"
         # sanitise for filename
-        y_clean = y.replace('/', '_').replace('\\', '_')
-        return f"{stem} — {y_clean}"
+        for ch in r'/\:*?"<>|':
+            title = title.replace(ch, '_')
+        return title
 
     def _save_plot(self):
         idx, _ = self._get_selected_tracker()
